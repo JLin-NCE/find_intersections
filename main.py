@@ -1,8 +1,9 @@
 import pandas as pd
-from fuzzywuzzy import fuzz
 import shapefile
 import os
 import shutil
+import math
+from collections import defaultdict
 
 def find_line_intersection(line1, line2):
     """
@@ -10,19 +11,22 @@ def find_line_intersection(line1, line2):
     
     Parameters:
     -----------
-    line1 : list of (x, y) tuples
+    line1 : list of (x, y) or (x, y, z) tuples
         First line
-    line2 : list of (x, y) tuples
+    line2 : list of (x, y) or (x, y, z) tuples
         Second line
         
     Returns:
     --------
     tuple or None
-        The (x, y) coordinates of the intersection point, or None if no intersection is found
+        The (x, y) or (x, y, z) coordinates of the intersection point, or None if no intersection is found
     """
     # Check if lines have points
     if not line1 or not line2:
         return None
+    
+    # Determine if we're dealing with 3D points
+    has_z = len(line1[0]) > 2 and len(line2[0]) > 2
     
     # Look for intersections between each segment of both lines
     for i in range(len(line1) - 1):
@@ -33,11 +37,11 @@ def find_line_intersection(line1, line2):
             p3 = line2[j]
             p4 = line2[j+1]
             
-            # Line segment parameters
-            x1, y1 = p1
-            x2, y2 = p2
-            x3, y3 = p3
-            x4, y4 = p4
+            # Line segment parameters (xy only)
+            x1, y1 = p1[0], p1[1]
+            x2, y2 = p2[0], p2[1]
+            x3, y3 = p3[0], p3[1]
+            x4, y4 = p4[0], p4[1]
             
             # Check if the line segments are not points
             if (x1 == x2 and y1 == y2) or (x3 == x4 and y3 == y4):
@@ -56,17 +60,176 @@ def find_line_intersection(line1, line2):
             
             # If parameters are between 0 and 1, lines intersect
             if 0 <= ua <= 1 and 0 <= ub <= 1:
-                # Calculate intersection point
+                # Calculate intersection point (xy)
                 intersect_x = x1 + ua * (x2 - x1)
                 intersect_y = y1 + ua * (y2 - y1)
-                return (intersect_x, intersect_y)
+                
+                # If we have Z values, interpolate Z at intersection point
+                if has_z:
+                    # Get Z values
+                    z1 = p1[2]
+                    z2 = p2[2]
+                    z3 = p3[2]
+                    z4 = p4[2]
+                    
+                    # Interpolate Z along first line
+                    intersect_z1 = z1 + ua * (z2 - z1)
+                    
+                    # Interpolate Z along second line
+                    intersect_z2 = z3 + ub * (z4 - z3)
+                    
+                    # Average the two Z values (may need a more sophisticated approach)
+                    intersect_z = (intersect_z1 + intersect_z2) / 2
+                    
+                    return (intersect_x, intersect_y, intersect_z, i, ua)
+                else:
+                    return (intersect_x, intersect_y, 0, i, ua)
     
     # No intersection found
     return None
 
-def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shapefile_path, output_path, similarity_threshold=70):
+def distance(p1, p2):
+    """Calculate Euclidean distance between two points."""
+    return math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+def interpolate_z(p1, p2, ratio):
+    """Interpolate Z value at a specific position between two points."""
+    if len(p1) > 2 and len(p2) > 2:
+        z1, z2 = p1[2], p2[2]
+        return z1 + ratio * (z2 - z1)
+    return 0
+
+def locate_point_on_line(point, line_points):
     """
-    Find line intersections that match criteria from the Excel file.
+    Find the segment index and parameter where a point falls on a line.
+    
+    Parameters:
+    -----------
+    point : tuple
+        The point coordinates (x, y) or (x, y, z)
+    line_points : list of tuples
+        List of line vertices
+    
+    Returns:
+    --------
+    tuple
+        (segment_index, parameter, distance_to_line)
+        segment_index: Index of the segment this point falls on
+        parameter: 0-1 value indicating position on the segment
+        distance_to_line: Distance from point to line
+    """
+    min_dist = float('inf')
+    best_segment = -1
+    best_param = 0
+    
+    for i in range(len(line_points) - 1):
+        p1 = line_points[i][:2]  # XY only
+        p2 = line_points[i+1][:2]
+        
+        # Vector from p1 to p2
+        v = (p2[0] - p1[0], p2[1] - p1[1])
+        # Length squared of segment
+        l2 = v[0]**2 + v[1]**2
+        
+        if l2 == 0:  # If segment is a point
+            continue
+            
+        # Vector from p1 to point
+        w = (point[0] - p1[0], point[1] - p1[1])
+        
+        # Projection of w onto v
+        proj = (w[0]*v[0] + w[1]*v[1]) / l2
+        
+        # Clamp to segment
+        proj = max(0, min(1, proj))
+        
+        # Closest point on segment
+        closest = (p1[0] + proj * v[0], p1[1] + proj * v[1])
+        
+        # Distance to closest point
+        dist = math.sqrt((point[0] - closest[0])**2 + (point[1] - closest[1])**2)
+        
+        if dist < min_dist:
+            min_dist = dist
+            best_segment = i
+            best_param = proj
+    
+    return best_segment, best_param, min_dist
+
+def split_line_at_intersections(line_points, intersections, has_z=False):
+    """
+    Split a line at multiple intersection points.
+    
+    Parameters:
+    -----------
+    line_points : list of tuples
+        The vertices of the line
+    intersections : list of tuples
+        List of intersection points, each with (x, y, z, segment_index, parameter)
+    has_z : bool
+        Whether the line has Z values
+    
+    Returns:
+    --------
+    list of line segments
+        Each segment is a list of points
+    """
+    if not intersections:
+        return [line_points]  # Return the original line if no intersections
+    
+    # Create a list of all points along the line, including intersections
+    all_points = []
+    
+    # Add the original line points with their position along the line
+    cumulative_length = 0
+    segment_lengths = []
+    
+    for i in range(len(line_points)):
+        if i > 0:
+            seg_length = distance(line_points[i-1][:2], line_points[i][:2])
+            cumulative_length += seg_length
+            segment_lengths.append(seg_length)
+        
+        point = line_points[i]
+        all_points.append((point, cumulative_length, i, 'original'))
+    
+    # Add the intersection points with their position along the line
+    for intersection in intersections:
+        x, y, z, seg_idx, param = intersection
+        
+        # Calculate position along the line
+        position = sum(segment_lengths[:seg_idx]) + param * segment_lengths[seg_idx]
+        
+        all_points.append(((x, y, z), position, seg_idx, 'intersection'))
+    
+    # Sort all points by their position along the line
+    all_points.sort(key=lambda p: p[1])
+    
+    # Create segments
+    segments = []
+    current_segment = []
+    
+    for point_info in all_points:
+        point, _, _, point_type = point_info
+        
+        # Add point to current segment
+        current_segment.append(point)
+        
+        # If this is an intersection point, end the current segment and start a new one
+        if point_type == 'intersection' and len(current_segment) > 1:
+            segments.append(current_segment)
+            current_segment = [point]  # Start new segment with the intersection point
+    
+    # Add the last segment if it has more than one point
+    if len(current_segment) > 1:
+        segments.append(current_segment)
+    
+    return segments
+
+def find_branch_name_segments(lake_havasu_file, shapefile_data_file, shapefile_path, output_path, intersections_output):
+    """
+    Find segments in a shapefile that match branch names in an Excel file,
+    create intersection points, and split lines at intersections.
     
     Parameters:
     -----------
@@ -77,9 +240,9 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
     shapefile_path : str
         Path to the shapefile
     output_path : str
-        Path for the output point shapefile
-    similarity_threshold : int
-        Threshold for fuzzy matching (default: 70)
+        Path for the output shapefile with split lines
+    intersections_output : str
+        Path for the output intersection points shapefile
     """
     # Load Excel files
     print(f"Reading {lake_havasu_file}...")
@@ -124,7 +287,16 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
     
     print(f"Loaded {len(shapes)} features from shapefile")
     
-    # Normalize names for better matching
+    # Check if shapefile has Z values
+    has_z = any(hasattr(shape, 'z') and shape.z for shape in shapes)
+    if has_z:
+        print("Shapefile contains Z values (elevation data)")
+    
+    # Determine the shape type
+    shape_type = sf.shapeType
+    print(f"Shapefile shape type: {shape_type}")
+    
+    # Normalize names for exact matching
     lake_havasu_df['Branch Name_norm'] = lake_havasu_df['Branch Name'].astype(str).str.strip().str.upper()
     shapefile_df['StreetName_norm'] = shapefile_df['StreetName'].astype(str).str.strip().str.upper()
     
@@ -134,12 +306,14 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
     if to_column:
         shapefile_df[f'{to_column}_norm'] = shapefile_df[to_column].astype(str).str.strip().str.upper()
     
-    # Create lists to store matches
-    matched_indices = set()
-    match_details = []
+    # Create dictionaries to store matches by shapefile index
+    streetname_matches = {}
+    from_matches = {}
+    to_matches = {}
+    all_matches = {}
     
-    # Find matches for Branch Name to StreetName
-    print(f"\nFinding matches based on Branch Name to StreetName with similarity threshold of {similarity_threshold}%...")
+    # Find exact matches for Branch Name to StreetName
+    print("\nFinding exact matches between Branch Name and StreetName...")
     
     for lake_index, lake_row in lake_havasu_df.iterrows():
         branch_name = lake_row['Branch Name_norm']
@@ -151,26 +325,35 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
             if not isinstance(street_name, str) or pd.isna(street_name) or street_name == 'NAN':
                 continue
             
-            # Calculate similarity scores
-            similarity_ratio = fuzz.ratio(branch_name, street_name)
-            token_sort_ratio = fuzz.token_sort_ratio(branch_name, street_name)
-            score = max(similarity_ratio, token_sort_ratio)
-            
-            if score >= similarity_threshold:
-                matched_indices.add(shape_index)
-                match_details.append({
-                    'shapefile_index': shape_index,
+            # Check for exact match
+            if branch_name == street_name:
+                if shape_index not in streetname_matches:
+                    streetname_matches[shape_index] = []
+                
+                # Store match details
+                match_info = {
                     'lake_havasu_index': lake_index,
                     'branch_name': lake_row['Branch Name'],
-                    'street_name': shape_row['StreetName'],
                     'match_type': 'Branch Name to StreetName',
-                    'score': score
-                })
-                print(f"Match: Branch Name '{branch_name}' to StreetName '{street_name}' with {score}% similarity")
+                    'match_street': True,
+                    'match_from': False,
+                    'match_to': False,
+                    'excel_row': lake_index
+                }
+                
+                streetname_matches[shape_index].append(match_info)
+                
+                # Add to all matches
+                if shape_index not in all_matches:
+                    all_matches[shape_index] = []
+                
+                all_matches[shape_index].append(match_info)
+                
+                print(f"Exact match: Branch Name '{branch_name}' = StreetName '{street_name}'")
     
-    # Find matches for Branch Name to From
+    # Find exact matches for Branch Name to From
     if from_column:
-        print(f"\nFinding matches based on Branch Name to {from_column} with similarity threshold of {similarity_threshold}%...")
+        print(f"\nFinding exact matches between Branch Name and {from_column}...")
         
         for lake_index, lake_row in lake_havasu_df.iterrows():
             branch_name = lake_row['Branch Name_norm']
@@ -182,26 +365,35 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
                 if not isinstance(from_value, str) or pd.isna(from_value) or from_value == 'NAN':
                     continue
                 
-                # Calculate similarity scores
-                similarity_ratio = fuzz.ratio(branch_name, from_value)
-                token_sort_ratio = fuzz.token_sort_ratio(branch_name, from_value)
-                score = max(similarity_ratio, token_sort_ratio)
-                
-                if score >= similarity_threshold:
-                    matched_indices.add(shape_index)
-                    match_details.append({
-                        'shapefile_index': shape_index,
+                # Check for exact match
+                if branch_name == from_value:
+                    if shape_index not in from_matches:
+                        from_matches[shape_index] = []
+                    
+                    # Store match details
+                    match_info = {
                         'lake_havasu_index': lake_index,
                         'branch_name': lake_row['Branch Name'],
-                        'from_value': shape_row[from_column],
-                        'match_type': 'Branch Name to From',
-                        'score': score
-                    })
-                    print(f"Match: Branch Name '{branch_name}' to From '{from_value}' with {score}% similarity")
+                        'match_type': f'Branch Name to {from_column}',
+                        'match_street': False,
+                        'match_from': True,
+                        'match_to': False,
+                        'excel_row': lake_index
+                    }
+                    
+                    from_matches[shape_index].append(match_info)
+                    
+                    # Add to all matches
+                    if shape_index not in all_matches:
+                        all_matches[shape_index] = []
+                    
+                    all_matches[shape_index].append(match_info)
+                    
+                    print(f"Exact match: Branch Name '{branch_name}' = {from_column} '{from_value}'")
     
-    # Find matches for Branch Name to To
+    # Find exact matches for Branch Name to To
     if to_column:
-        print(f"\nFinding matches based on Branch Name to {to_column} with similarity threshold of {similarity_threshold}%...")
+        print(f"\nFinding exact matches between Branch Name and {to_column}...")
         
         for lake_index, lake_row in lake_havasu_df.iterrows():
             branch_name = lake_row['Branch Name_norm']
@@ -213,125 +405,310 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
                 if not isinstance(to_value, str) or pd.isna(to_value) or to_value == 'NAN':
                     continue
                 
-                # Calculate similarity scores
-                similarity_ratio = fuzz.ratio(branch_name, to_value)
-                token_sort_ratio = fuzz.token_sort_ratio(branch_name, to_value)
-                score = max(similarity_ratio, token_sort_ratio)
-                
-                if score >= similarity_threshold:
-                    matched_indices.add(shape_index)
-                    match_details.append({
-                        'shapefile_index': shape_index,
+                # Check for exact match
+                if branch_name == to_value:
+                    if shape_index not in to_matches:
+                        to_matches[shape_index] = []
+                    
+                    # Store match details
+                    match_info = {
                         'lake_havasu_index': lake_index,
                         'branch_name': lake_row['Branch Name'],
-                        'to_value': shape_row[to_column],
-                        'match_type': 'Branch Name to To',
-                        'score': score
-                    })
-                    print(f"Match: Branch Name '{branch_name}' to To '{to_value}' with {score}% similarity")
+                        'match_type': f'Branch Name to {to_column}',
+                        'match_street': False,
+                        'match_from': False,
+                        'match_to': True,
+                        'excel_row': lake_index
+                    }
+                    
+                    to_matches[shape_index].append(match_info)
+                    
+                    # Add to all matches
+                    if shape_index not in all_matches:
+                        all_matches[shape_index] = []
+                    
+                    all_matches[shape_index].append(match_info)
+                    
+                    print(f"Exact match: Branch Name '{branch_name}' = {to_column} '{to_value}'")
     
-    print(f"\nFound {len(matched_indices)} matched lines from Excel data")
+    # Get matched line indices
+    matched_indices = list(all_matches.keys())
+    print(f"\nFound {len(matched_indices)} lines with exact matches from Excel data")
     
-    # Create a writer for the output shapefile
-    w = shapefile.Writer(output_path)
+    # Create a writer for the intersections shapefile
+    # If original has Z values, create a Z-aware shapefile
+    if has_z:
+        w_intersect = shapefile.Writer(intersections_output, shapeType=shapefile.POINTZ)
+    else:
+        w_intersect = shapefile.Writer(intersections_output)
     
-    # Add fields to the output shapefile
-    w.field('LINE1_IDX', 'N', 10, 0)
-    w.field('LINE2_IDX', 'N', 10, 0)
-    w.field('BRANCH_NAME1', 'C', 100, 0)
-    w.field('BRANCH_NAME2', 'C', 100, 0)
-    w.field('MATCH_TYPE1', 'C', 25, 0)
-    w.field('MATCH_TYPE2', 'C', 25, 0)
+    # Add fields to the intersections shapefile
+    w_intersect.field('LINE1_IDX', 'N', 10, 0)
+    w_intersect.field('LINE2_IDX', 'N', 10, 0)
+    w_intersect.field('BRANCH1', 'C', 100, 0)
+    w_intersect.field('BRANCH2', 'C', 100, 0)
     
-    # Find all intersections where at least one line matches
-    print("\nFinding line intersections where at least one line matches criteria...")
-    intersections = []
+    # Add specific match type fields
+    w_intersect.field('L1_STREET', 'C', 1, 0)
+    w_intersect.field('L1_FROM', 'C', 1, 0)
+    w_intersect.field('L1_TO', 'C', 1, 0)
+    w_intersect.field('L2_STREET', 'C', 1, 0)
+    w_intersect.field('L2_FROM', 'C', 1, 0)
+    w_intersect.field('L2_TO', 'C', 1, 0)
+    
+    # Find intersections ONLY between matched lines (both must be matched)
+    print("\nFinding intersections between exact-matched lines only...")
+    all_intersections = {}  # Dictionary to store intersections by line index
+    intersections_list = []  # List to store all intersections for the point shapefile
     
     # Track progress
-    total_comparisons = len(matched_indices) * len(shapes)
+    total_comparisons = len(matched_indices) * (len(matched_indices) - 1) // 2
     progress_step = max(1, total_comparisons // 10)
     comparisons_done = 0
     
-    # Dictionary to look up match details by shapefile index
-    match_lookup = {}
-    for match in match_details:
-        idx = match['shapefile_index']
-        if idx not in match_lookup:
-            match_lookup[idx] = []
-        match_lookup[idx].append(match)
-    
-    # For each matched line, check intersections with all other lines
-    for i in matched_indices:
-        for j in range(len(shapes)):
+    # Check all pairs of matched lines
+    for i in range(len(matched_indices)):
+        for j in range(i + 1, len(matched_indices)):
             # Update progress
             comparisons_done += 1
-            if comparisons_done % progress_step == 0:
+            if total_comparisons >= 10 and comparisons_done % progress_step == 0:
                 progress_percent = (comparisons_done / total_comparisons) * 100
                 print(f"Progress: {progress_percent:.1f}% ({comparisons_done}/{total_comparisons})")
             
-            # Skip self-intersection
-            if i == j:
-                continue
+            # Get actual indices
+            idx1 = matched_indices[i]
+            idx2 = matched_indices[j]
             
             # Get shapes
-            shape1 = shapes[i]
-            shape2 = shapes[j]
+            shape1 = shapes[idx1]
+            shape2 = shapes[idx2]
             
             # Skip non-line shapes
             if shape1.shapeType not in [3, 5, 13, 15, 23, 25] or shape2.shapeType not in [3, 5, 13, 15, 23, 25]:
                 continue
             
-            # Find intersection
-            intersection_point = find_line_intersection(shape1.points, shape2.points)
+            # Prepare 3D points if available
+            points1 = shape1.points
+            points2 = shape2.points
             
-            if intersection_point:
-                # Get match details for both lines (if available)
-                line1_matches = match_lookup.get(i, [])
-                line2_matches = match_lookup.get(j, [])
+            # If shapes have Z values, combine XY with Z
+            if has_z and hasattr(shape1, 'z') and hasattr(shape2, 'z'):
+                points1 = [(p[0], p[1], z) for p, z in zip(shape1.points, shape1.z)]
+                points2 = [(p[0], p[1], z) for p, z in zip(shape2.points, shape2.z)]
+            
+            # Find intersection
+            intersection = find_line_intersection(points1, points2)
+            
+            if intersection:
+                x, y, z, seg_idx, param = intersection
                 
-                # Store intersection with details
+                # Get match details
+                line1_match = all_matches[idx1][0]  # Using first match if multiple exist
+                line2_match = all_matches[idx2][0]  # Using first match if multiple exist
+                
+                # Store intersection for the point shapefile
                 intersection_data = {
-                    'point': intersection_point,
-                    'line1_idx': i,
-                    'line2_idx': j,
-                    'line1_matches': line1_matches,
-                    'line2_matches': line2_matches
+                    'point': (x, y, z),
+                    'line1_idx': idx1,
+                    'line2_idx': idx2,
+                    'branch1': line1_match['branch_name'],
+                    'branch2': line2_match['branch_name'],
+                    'line1_street': line1_match['match_street'],
+                    'line1_from': line1_match['match_from'],
+                    'line1_to': line1_match['match_to'],
+                    'line2_street': line2_match['match_street'],
+                    'line2_from': line2_match['match_from'],
+                    'line2_to': line2_match['match_to']
                 }
                 
-                intersections.append(intersection_data)
+                intersections_list.append(intersection_data)
                 
-                # Print some details
-                line1_branch = line1_matches[0]['branch_name'] if line1_matches else "N/A"
-                line2_branch = line2_matches[0]['branch_name'] if line2_matches else "N/A"
-                print(f"Intersection found between line {i} (Branch: {line1_branch}) and line {j} (Branch: {line2_branch})")
+                # Store intersection for line splitting
+                if idx1 not in all_intersections:
+                    all_intersections[idx1] = []
+                all_intersections[idx1].append((x, y, z, seg_idx, param))
+                
+                # Also store for the second line
+                # Find segment index and parameter for line 2
+                seg_idx2, param2, _ = locate_point_on_line((x, y), shape2.points)
+                if idx2 not in all_intersections:
+                    all_intersections[idx2] = []
+                all_intersections[idx2].append((x, y, z, seg_idx2, param2))
+                
+                # Create match description for console output
+                line1_match_desc = []
+                if line1_match['match_street']:
+                    line1_match_desc.append("StreetName")
+                if line1_match['match_from']:
+                    line1_match_desc.append("From")
+                if line1_match['match_to']:
+                    line1_match_desc.append("To")
+                
+                line2_match_desc = []
+                if line2_match['match_street']:
+                    line2_match_desc.append("StreetName")
+                if line2_match['match_from']:
+                    line2_match_desc.append("From")
+                if line2_match['match_to']:
+                    line2_match_desc.append("To")
+                
+                line1_desc = ", ".join(line1_match_desc)
+                line2_desc = ", ".join(line2_match_desc)
+                
+                print(f"Intersection found between '{line1_match['branch_name']}' ({line1_desc}) and '{line2_match['branch_name']}' ({line2_desc})")
     
-    print(f"\nFound {len(intersections)} intersections involving matched lines")
+    print(f"\nFound {len(intersections_list)} intersections between exactly matched lines")
     
     # Write intersections to shapefile
-    for intersection in intersections:
-        # Add point
-        w.point(intersection['point'][0], intersection['point'][1])
+    for intersection in intersections_list:
+        # Add point (with Z value if available)
+        point = intersection['point']
+        if len(point) > 2 and has_z:
+            w_intersect.pointz(point[0], point[1], point[2])
+        else:
+            w_intersect.point(point[0], point[1])
         
-        # Prepare record data
-        line1_idx = intersection['line1_idx']
-        line2_idx = intersection['line2_idx']
-        
-        # Get branch names
-        branch_name1 = intersection['line1_matches'][0]['branch_name'] if intersection['line1_matches'] else "N/A"
-        branch_name2 = intersection['line2_matches'][0]['branch_name'] if intersection['line2_matches'] else "N/A"
-        
-        # Get match types
-        match_type1 = intersection['line1_matches'][0]['match_type'] if intersection['line1_matches'] else "N/A"
-        match_type2 = intersection['line2_matches'][0]['match_type'] if intersection['line2_matches'] else "N/A"
+        # Convert boolean values to Y/N for shapefile
+        l1_street = "Y" if intersection['line1_street'] else "N"
+        l1_from = "Y" if intersection['line1_from'] else "N"
+        l1_to = "Y" if intersection['line1_to'] else "N"
+        l2_street = "Y" if intersection['line2_street'] else "N"
+        l2_from = "Y" if intersection['line2_from'] else "N"
+        l2_to = "Y" if intersection['line2_to'] else "N"
         
         # Add record
-        w.record(line1_idx, line2_idx, branch_name1, branch_name2, match_type1, match_type2)
+        w_intersect.record(
+            intersection['line1_idx'],
+            intersection['line2_idx'],
+            intersection['branch1'],
+            intersection['branch2'],
+            l1_street,
+            l1_from,
+            l1_to,
+            l2_street,
+            l2_from,
+            l2_to
+        )
     
-    # Save shapefile
-    w.close()
+    # Save the intersections shapefile
+    w_intersect.close()
     
-    # Copy projection file
+    # Copy the .prj file for intersections
     prj_path = shapefile_path.replace('.shp', '.prj')
+    if os.path.exists(prj_path):
+        try:
+            output_prj = f"{intersections_output}.prj"
+            shutil.copy2(prj_path, output_prj)
+            print(f"Copied projection file to {output_prj}")
+        except Exception as e:
+            print(f"Warning: Could not copy projection file: {e}")
+    
+    print(f"Successfully created {intersections_output}.shp with {len(intersections_list)} intersection points")
+    
+    # Now create a new shapefile with the split lines
+    print("\n--- Creating Split Line Shapefile ---")
+    
+    # Create a writer for the output shapefile, using the same shape type as original
+    w_output = shapefile.Writer(output_path, shapeType=shape_type)
+    
+    # Copy field definitions from the original shapefile
+    for field in fields:
+        w_output.field(*field)
+    
+    # Add a field for the original feature ID
+    w_output.field('ORIG_ID', 'N', 10, 0)
+    # Add a field for the segment number (when a line is split into multiple segments)
+    w_output.field('SEG_NUM', 'N', 10, 0)
+    # Add a field for the branch name (if matched)
+    w_output.field('BRANCH_NAME', 'C', 100, 0)
+    
+    # Process each shape
+    for i, shape in enumerate(shapes):
+        # Get the original record
+        record = list(records[i])
+        
+        # Check if this shape has intersections
+        if i in all_intersections and len(all_intersections[i]) > 0:
+            # Get branch name if this is a matched line
+            branch_name = ""
+            if i in all_matches:
+                branch_name = all_matches[i][0]['branch_name']
+            
+            # Get the points and Z values (if any)
+            points = shape.points
+            z_values = shape.z if has_z and hasattr(shape, 'z') else None
+            
+            # If we have Z values, combine XY with Z
+            if has_z and z_values:
+                points_3d = [(p[0], p[1], z) for p, z in zip(points, z_values)]
+                
+                # Split the line at intersections
+                segments = split_line_at_intersections(points_3d, all_intersections[i], has_z=True)
+                
+                # Add each segment to the output shapefile
+                for seg_num, segment in enumerate(segments):
+                    if len(segment) >= 2:  # Only add segments with at least 2 points
+                        # Split into XY and Z
+                        xy_points = [(p[0], p[1]) for p in segment]
+                        z_vals = [p[2] for p in segment]
+                        
+                        # Combine XY and Z coordinates for linez method
+                        points_with_z = []
+                        for i, point in enumerate(xy_points):
+                            x, y = point
+                            z = z_vals[i] if i < len(z_vals) else 0
+                            points_with_z.append((x, y, z))
+                        
+                        # Use the linez method with properly formatted 3D points
+                        w_output.linez([points_with_z])
+                        
+                        # Add record for this segment
+                        new_record = record + [i, seg_num, branch_name]
+                        w_output.record(*new_record)
+            else:
+                # Split the line at intersections (no Z values)
+                segments = split_line_at_intersections(points, all_intersections[i], has_z=False)
+                
+                # Add each segment to the output shapefile
+                for seg_num, segment in enumerate(segments):
+                    if len(segment) >= 2:  # Only add segments with at least 2 points
+                        w_output.line([segment])
+                        
+                        # Add record for this segment
+                        new_record = record + [i, seg_num, branch_name]
+                        w_output.record(*new_record)
+        else:
+            # No intersections, just copy the original shape and record
+            branch_name = ""
+            if i in all_matches:
+                branch_name = all_matches[i][0]['branch_name']
+            
+            # Add the shape to the output
+            # Handle different shape types appropriately
+            if shape.shapeType == shapefile.POLYLINE:
+                w_output.line([shape.points])
+            elif shape.shapeType == shapefile.POLYLINEZ and hasattr(shape, 'z'):
+                # Combine XY and Z coordinates for linez method
+                points_with_z = []
+                for idx, point in enumerate(shape.points):
+                    x, y = point
+                    z = shape.z[idx] if idx < len(shape.z) else 0
+                    points_with_z.append((x, y, z))
+                
+                # Use the linez method with properly formatted 3D points
+                w_output.linez([points_with_z])
+            else:
+                # Default fallback
+                w_output.line([shape.points])
+            
+            # Add record with original ID
+            new_record = record + [i, 0, branch_name]
+            w_output.record(*new_record)
+    
+    # Save the output shapefile
+    w_output.close()
+    
+    # Copy the .prj file
     if os.path.exists(prj_path):
         try:
             output_prj = f"{output_path}.prj"
@@ -340,28 +717,29 @@ def find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shape
         except Exception as e:
             print(f"Warning: Could not copy projection file: {e}")
     
-    print(f"Successfully created {output_path}.shp with {len(intersections)} intersection points")
+    print(f"Successfully created {output_path}.shp with split lines")
 
 if __name__ == "__main__":
     # File paths
     lake_havasu_file = "Lake Havasu Sections - Jordan.xlsx"
     shapefile_data_file = "Shapefile Data.xlsx"
     shapefile_path = "Shapefile/LakeHavasuJordan.shp"
-    output_folder = "Matched_Intersections"
+    output_folder = "Lake_Havasu_Analysis"
     
     # Create output folder if it doesn't exist
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
         print(f"Created output folder: {output_folder}")
     
-    output_shapefile = os.path.join(output_folder, "LakeHavasu_Matched_Intersections")
+    # Output file paths
+    intersections_output = os.path.join(output_folder, "Intersections")
+    split_lines_output = os.path.join(output_folder, "Split_Lines")
     
-    # Define similarity threshold
-    similarity_threshold = 70  # Match if similarity is 70% or higher
-    
-    # Run the intersection finder with matches
+    # Run the analysis
     try:
-        find_matched_line_intersections(lake_havasu_file, shapefile_data_file, shapefile_path, 
-                                        output_shapefile, similarity_threshold)
+        find_branch_name_segments(lake_havasu_file, shapefile_data_file, shapefile_path, 
+                                   split_lines_output, intersections_output)
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
