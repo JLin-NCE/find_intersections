@@ -623,9 +623,13 @@ def find_branch_name_segments(lake_havasu_file, shapefile_data_file, shapefile_p
     w_output.field('BRANCH_NAME', 'C', 100, 0)
     
     # Process each shape
+    # Process each shape
     for i, shape in enumerate(shapes):
         # Get the original record
         record = list(records[i])
+        
+        # Variables to track shapes actually written to the output
+        segments_written = 0
         
         # Check if this shape has intersections
         if i in all_intersections and len(all_intersections[i]) > 0:
@@ -648,23 +652,35 @@ def find_branch_name_segments(lake_havasu_file, shapefile_data_file, shapefile_p
                 # Add each segment to the output shapefile
                 for seg_num, segment in enumerate(segments):
                     if len(segment) >= 2:  # Only add segments with at least 2 points
-                        # Split into XY and Z
-                        xy_points = [(p[0], p[1]) for p in segment]
-                        z_vals = [p[2] for p in segment]
-                        
-                        # Combine XY and Z coordinates for linez method
-                        points_with_z = []
-                        for i, point in enumerate(xy_points):
-                            x, y = point
-                            z = z_vals[i] if i < len(z_vals) else 0
-                            points_with_z.append((x, y, z))
-                        
-                        # Use the linez method with properly formatted 3D points
-                        w_output.linez([points_with_z])
-                        
-                        # Add record for this segment
-                        new_record = record + [i, seg_num, branch_name]
-                        w_output.record(*new_record)
+                        try:
+                            # Split into XY and Z
+                            xy_points = [(p[0], p[1]) for p in segment]
+                            z_vals = [p[2] for p in segment]
+                            
+                            # Combine XY and Z coordinates for linez method
+                            points_with_z = []
+                            for j, point in enumerate(xy_points):
+                                x, y = point
+                                z = z_vals[j] if j < len(z_vals) else 0
+                                points_with_z.append((x, y, z))
+                            
+                            # Skip empty segments
+                            if len(points_with_z) < 2:
+                                print(f"Skipping invalid segment {i}-{seg_num} with {len(points_with_z)} points")
+                                continue
+                                
+                            # Use the linez method with properly formatted 3D points
+                            w_output.linez([points_with_z])
+                            
+                            # Add record for this segment - ONLY if the shape was written successfully
+                            new_record = record + [i, seg_num, branch_name]
+                            w_output.record(*new_record)
+                            
+                            segments_written += 1
+                        except Exception as e:
+                            print(f"Error writing segment {i}-{seg_num}: {e}")
+                            # Don't increment segments_written since we failed
+                
             else:
                 # Split the line at intersections (no Z values)
                 segments = split_line_at_intersections(points, all_intersections[i], has_z=False)
@@ -672,38 +688,87 @@ def find_branch_name_segments(lake_havasu_file, shapefile_data_file, shapefile_p
                 # Add each segment to the output shapefile
                 for seg_num, segment in enumerate(segments):
                     if len(segment) >= 2:  # Only add segments with at least 2 points
-                        w_output.line([segment])
-                        
-                        # Add record for this segment
-                        new_record = record + [i, seg_num, branch_name]
-                        w_output.record(*new_record)
+                        try:
+                            # Write the line
+                            w_output.line([segment])
+                            
+                            # Add record for this segment
+                            new_record = record + [i, seg_num, branch_name]
+                            w_output.record(*new_record)
+                            
+                            segments_written += 1
+                        except Exception as e:
+                            print(f"Error writing segment {i}-{seg_num}: {e}")
+                            # Don't increment segments_written since we failed
+            
+            # If no valid segments were written for this shape, write a null shape
+            if segments_written == 0:
+                print(f"Warning: No valid segments for shape {i}, writing null shape to maintain sync")
+                w_output.null()
+                new_record = record + [i, 0, branch_name]
+                w_output.record(*new_record)
+                
         else:
             # No intersections, just copy the original shape and record
             branch_name = ""
             if i in all_matches:
                 branch_name = all_matches[i][0]['branch_name']
             
-            # Add the shape to the output
-            # Handle different shape types appropriately
-            if shape.shapeType == shapefile.POLYLINE:
-                w_output.line([shape.points])
-            elif shape.shapeType == shapefile.POLYLINEZ and hasattr(shape, 'z'):
-                # Combine XY and Z coordinates for linez method
-                points_with_z = []
-                for idx, point in enumerate(shape.points):
-                    x, y = point
-                    z = shape.z[idx] if idx < len(shape.z) else 0
-                    points_with_z.append((x, y, z))
-                
-                # Use the linez method with properly formatted 3D points
-                w_output.linez([points_with_z])
-            else:
-                # Default fallback
-                w_output.line([shape.points])
-            
-            # Add record with original ID
-            new_record = record + [i, 0, branch_name]
-            w_output.record(*new_record)
+            try:
+                # Add the shape to the output
+                # Handle different shape types appropriately
+                if shape.shapeType == shapefile.POLYLINE:
+                    if len(shape.points) >= 2:
+                        w_output.line([shape.points])
+                        # Add record with original ID
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+                    else:
+                        print(f"Warning: Shape {i} has fewer than 2 points, writing null shape")
+                        w_output.null()
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+                        
+                elif shape.shapeType == shapefile.POLYLINEZ and hasattr(shape, 'z'):
+                    if len(shape.points) >= 2:
+                        # Combine XY and Z coordinates for linez method
+                        points_with_z = []
+                        for idx, point in enumerate(shape.points):
+                            x, y = point
+                            z = shape.z[idx] if idx < len(shape.z) else 0
+                            points_with_z.append((x, y, z))
+                        
+                        # Use the linez method with properly formatted 3D points
+                        w_output.linez([points_with_z])
+                        
+                        # Add record with original ID
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+                    else:
+                        print(f"Warning: Shape {i} has fewer than 2 points, writing null shape")
+                        w_output.null()
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+                else:
+                    # Check if shape has enough points
+                    if len(shape.points) >= 2:
+                        # Default fallback
+                        w_output.line([shape.points])
+                        
+                        # Add record with original ID
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+                    else:
+                        print(f"Warning: Shape {i} has fewer than 2 points, writing null shape")
+                        w_output.null()
+                        new_record = record + [i, 0, branch_name]
+                        w_output.record(*new_record)
+            except Exception as e:
+                print(f"Error writing shape {i}: {e}")
+                # Write a null shape to maintain sync
+                w_output.null()
+                new_record = record + [i, 0, branch_name]
+                w_output.record(*new_record)
     
     # Save the output shapefile
     w_output.close()
